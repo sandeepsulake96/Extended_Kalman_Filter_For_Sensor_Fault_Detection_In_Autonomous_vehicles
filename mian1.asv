@@ -1,0 +1,403 @@
+%% Midterm 2: Fualt diagnostics question on EKF and GOS
+clc; clear all; close all;
+
+%% Reference trajectory
+ref = load('ref.mat');
+
+%% control input
+load('u_cl.mat');
+
+%% General
+dt = 0.1;         % Time step (s)
+Tfinal = 4.5;     % Final simulation time (s)
+t = 0:dt:Tfinal;  % Simulation time steps (s)
+
+% System Parameters
+p.Izz = 3092;     % Vehicle yaw moment of inertia (kg.m^2)
+p.Cf  = 6e4;      % Front tires cornering stiffness (N/rad)
+p.rst = 1/15;     % Steering ratio 
+p.Cr  = 5e4;      % Rear tires cornering stiffness (N/rad)
+p.Cd  = 0.3;      % max decel
+p.Ca  = 0.5;      % max acceleration
+p.f0  = 0.1;      % aero drag coeff
+p.f1  = 5;        % aero drag coeff
+p.f2  = 0.25;     % aero drag coeff
+p.lf  = 1.1579;   % Distance between vehicle CG to front axle (m)
+p.lr  = 1.689;    % Distance between vehicle CG to rear axle (m)
+p.m   = 1767.2;   % Vehilce mass (kg)
+p.acc_g   = 9.81;     % acceleration due to gravity
+p.v0  = 15;       % Velocity of other actor (constant)
+
+% init estimate covariance matrix for EKF
+P = eye(6,6);  
+
+%% Ouput matrix 'C'
+
+C = [1 0 0 0 0 0;...    % backtrack from engine speed sensor [y1]
+    1 0 0 0 0 0;...     % backtrack from wheel speed sensor [y2]
+    0 0 1 0 0 0;...     % IMU for orientation [y3]
+    0 0 0 1 0 0;...     % Yaw rate sensor [y4]
+    0 0 0 0 1 0;...     % GPS X-pos [y5]
+    0 0 0 0 0 1;...     % GPS Y-pos [y6]
+    0 0 0 0 1 0;...     % Lidar X-pos [y7]
+    0 0 0 0 0 1;...     % Lidar Y-pos [y8]
+    0 0 1 0 0 0];       % Lidar orientation [y9] (9x6 matrix)
+
+%% PART 1: Check observability
+
+% step-1 compute A(t) using system dynamics equations and linearizing
+syms ux uy phi r X Y real
+
+%%
+F1=-dt*((p.f0+p.f1*ux+p.f2*ux^2)/(p.m))+ux;
+
+F2= dt*(-((2*p.Cf+2*p.Cr)/(p.m*ux))*uy + (((2*p.Cr*p.lr-2*p.Cf*p.lf)/(p.m*ux))-ux)*r) + uy;
+
+F3 = r*dt+phi;
+
+F4= dt*(((2*p.Cr*p.lr-2*p.Cf*p.lf)/(p.Izz*ux))*uy - ((2*p.Cf*p.lf*p.lf+2*p.Cr*p.lr*p.lr)/(p.Izz*ux))*r)+r;
+
+F5= dt*(ux*cos(phi) - uy*sin(phi))+X;
+
+F6= dt*(ux*sin(phi)+uy*cos(phi))+Y;
+
+%%
+% F1=-((p.f0+p.f1*ux+p.f2*ux^2)/(p.m));
+% 
+% F2= -((2*p.Cf+2*p.Cr)/(p.m*ux))*uy + (((2*p.Cr*p.lr-2*p.Cf*p.lf)/(p.m*ux))-ux)*r ;
+% 
+% F3 = r;
+% 
+% F4= (((2*p.Cr*p.lr-2*p.Cf*p.lf)/(p.Izz*ux))*uy - ((2*p.Cf*p.lf*p.lf+2*p.Cr*p.lr*p.lr)/(p.Izz*ux))*r);
+% 
+% F5= ux*cos(phi) - uy*sin(phi);
+% 
+% F6= ux*sin(phi) + uy*cos(phi);
+%% Calculate the Jacobian matrix
+
+Fk_j=jacobian([F1;F2;F3;F4;F5;F6],[ux;uy;phi;r;X;Y]);
+
+
+%% check observability
+x0 = [30; 0; 0; 0; -8.44; -0.8];        % initial state
+
+Fk1 = double(subs(Fk_j,[ux uy phi r X Y],x0'));
+A=Fk1;
+%checking observability
+rank(obsv(A,C)) == 6;
+
+%% Sensor parameters
+
+% Assume no processs noise
+variance = 1e-3;        % sensor noise parameters
+
+
+%% Main simulation
+
+% build callable function for the dynamics
+% mex dyn.c -DMATLAB_MEX_FILE
+mex dyn.c   
+
+x0 = [30; 0; 0; 0; -8.44; -0.8];        % initial state
+xx = [];                                % to hold state trajecotry
+xx = [xx x0];
+
+tsim = [];                              % Simulation time
+actorX = []; actorY = [];               % to hold actor position during sim
+t0 = 0;                                 % initial time
+tsim = [tsim; t0];
+
+iter = 2;                               % simulation iteration
+xhat(:,1)= x0;
+
+%loading sensor measurements and true values 
+load('y.mat');load("xx.mat");
+
+%%
+R=diag([variance;variance;variance;variance;variance;variance;variance;variance;variance]);
+%R=diag([0.01;0.02;0.005;0.01;0.002;0.003;0.001;0.06;0.003]);
+%R=zeros(9,9);
+while iter < Tfinal/dt
+       %% PART 2: Full state estimate considering all measurements using an EKF
+    
+
+       Fk=double(subs(Fk_j,[ux uy phi r X Y],xhat(:,iter-1)'));
+
+       % priori update
+       x_prior(:,iter) = Fk*xhat(:,iter-1);
+       P_prior = Fk*P*Fk';
+
+       % measurement update
+       Sk=C*P_prior*C'+R;
+       K = P_prior*C'*(eye(size(Sk))*inv(Sk));
+       xhat(:,iter)=x_prior(:,iter)+K*(y(:,iter) - C*x_prior(:,iter));
+   
+       P= (eye(6)-K*C)*P_prior;
+    
+    
+    
+    %%
+    %get current location of other vehicle from scenario reference
+    act_X = interp1(ref.t_act, ref.act_x, tsim(iter-1));
+    act_Y = interp1(ref.t_act, ref.act_y, tsim(iter-1));
+    act = [act_X; act_Y]; act = act(:)';
+    actorX = [actorX act_X(1)];
+    actorY = [actorY act_Y(1)];
+    
+    % increase time and iter
+    tsim(iter) = tsim(iter-1)+dt;
+    iter = iter + 1;
+    
+end
+
+%% PART 3: Compare estimated with true trajectory of the ego vehicle
+
+f2 = figure(2);
+
+plot(xx(6,:), xx(5,:),'b-','LineWidth',1.5);    % True state
+grid on; box on; hold on;
+
+plot(xhat(6,:),xhat(5,:),'LineWidth',1.5)% Estimated states
+
+hold on
+
+plot(y(6,:),y(5,:),'g--','LineWidth',1.5) % sensor measurement
+ylabel('X [m]'); xlabel('Y [m]');
+xlim([-40 40]); ylim([-20 140]);
+
+legend('True state','EKF estimated state','Sensor Measurements')
+
+
+%% PART 4: Decompose output space and check observability
+
+C1 = [...              % backtrack from engine speed sensor [y1]
+    1 0 0 0 0 0;...     % backtrack from wheel speed sensor [y2]
+    0 0 1 0 0 0;...     % IMU for orientation [y3]
+    0 0 0 1 0 0;...     % Yaw rate sensor [y4]
+    0 0 0 0 1 0;...     % GPS X-pos [y5]
+    0 0 0 0 0 1;...     % GPS Y-pos [y6]
+    0 0 0 0 1 0;...     % Lidar X-pos [y7]
+    0 0 0 0 0 1;...     % Lidar Y-pos [y8]
+    0 0 1 0 0 0];       % Lidar orientation [y9] (9x6 matrix)
+C2 = [1 0 0 0 0 0;...    % backtrack from engine speed sensor [y1]
+   ...     % backtrack from wheel speed sensor [y2]
+    0 0 1 0 0 0;...     % IMU for orientation [y3]
+    0 0 0 1 0 0;...     % Yaw rate sensor [y4]
+    0 0 0 0 1 0;...     % GPS X-pos [y5]
+    0 0 0 0 0 1;...     % GPS Y-pos [y6]
+    0 0 0 0 1 0;...     % Lidar X-pos [y7]
+    0 0 0 0 0 1;...     % Lidar Y-pos [y8]
+    0 0 1 0 0 0];       % Lidar orientation [y9] (9x6 matrix)
+C3 = [1 0 0 0 0 0;...    % backtrack from engine speed sensor [y1]
+    1 0 0 0 0 0;...     % backtrack from wheel speed sensor [y2]
+   ...     % IMU for orientation [y3]
+    0 0 0 1 0 0;...     % Yaw rate sensor [y4]
+    0 0 0 0 1 0;...     % GPS X-pos [y5]
+    0 0 0 0 0 1;...     % GPS Y-pos [y6]
+    0 0 0 0 1 0;...     % Lidar X-pos [y7]
+    0 0 0 0 0 1;...     % Lidar Y-pos [y8]
+    0 0 1 0 0 0];       % Lidar orientation [y9] (9x6 matrix)
+C4 = [1 0 0 0 0 0;...    % backtrack from engine speed sensor [y1]
+    1 0 0 0 0 0;...     % backtrack from wheel speed sensor [y2]
+    0 0 1 0 0 0;...     % IMU for orientation [y3]
+    ...     % Yaw rate sensor [y4]
+    0 0 0 0 1 0;...     % GPS X-pos [y5]
+    0 0 0 0 0 1;...     % GPS Y-pos [y6]
+    0 0 0 0 1 0;...     % Lidar X-pos [y7]
+    0 0 0 0 0 1;...     % Lidar Y-pos [y8]
+    0 0 1 0 0 0];       % Lidar orientation [y9] (9x6 matrix)
+C5 = [1 0 0 0 0 0;...    % backtrack from engine speed sensor [y1]
+    1 0 0 0 0 0;...     % backtrack from wheel speed sensor [y2]
+    0 0 1 0 0 0;...     % IMU for orientation [y3]
+    0 0 0 1 0 0;...     % Yaw rate sensor [y4]
+    ...     % GPS X-pos [y5]
+    0 0 0 0 0 1;...     % GPS Y-pos [y6]
+    0 0 0 0 1 0;...     % Lidar X-pos [y7]
+    0 0 0 0 0 1;...     % Lidar Y-pos [y8]
+    0 0 1 0 0 0];       % Lidar orientation [y9] (9x6 matrix)
+C6 = [1 0 0 0 0 0;...    % backtrack from engine speed sensor [y1]
+    1 0 0 0 0 0;...     % backtrack from wheel speed sensor [y2]
+    0 0 1 0 0 0;...     % IMU for orientation [y3]
+    0 0 0 1 0 0;...     % Yaw rate sensor [y4]
+    0 0 0 0 1 0;...     % GPS X-pos [y5]
+   ...     % GPS Y-pos [y6]
+    0 0 0 0 1 0;...     % Lidar X-pos [y7]
+    0 0 0 0 0 1;...     % Lidar Y-pos [y8]
+    0 0 1 0 0 0];       % Lidar orientation [y9] (9x6 matrix)
+C7 = [1 0 0 0 0 0;...    % backtrack from engine speed sensor [y1]
+    1 0 0 0 0 0;...     % backtrack from wheel speed sensor [y2]
+    0 0 1 0 0 0;...     % IMU for orientation [y3]
+    0 0 0 1 0 0;...     % Yaw rate sensor [y4]
+    0 0 0 0 1 0;...     % GPS X-pos [y5]
+    0 0 0 0 0 1;...     % GPS Y-pos [y6]
+    ...     % Lidar X-pos [y7]
+    0 0 0 0 0 1;...     % Lidar Y-pos [y8]
+    0 0 1 0 0 0];       % Lidar orientation [y9] (9x6 matrix)
+C8 = [1 0 0 0 0 0;...    % backtrack from engine speed sensor [y1]
+    1 0 0 0 0 0;...     % backtrack from wheel speed sensor [y2]
+    0 0 1 0 0 0;...     % IMU for orientation [y3]
+    0 0 0 1 0 0;...     % Yaw rate sensor [y4]
+    0 0 0 0 1 0;...     % GPS X-pos [y5]
+    0 0 0 0 0 1;...     % GPS Y-pos [y6]
+    0 0 0 0 1 0;...     % Lidar X-pos [y7]
+    ...     % Lidar Y-pos [y8]
+    0 0 1 0 0 0];       % Lidar orientation [y9] (9x6 matrix)
+C9 = [1 0 0 0 0 0;...    % backtrack from engine speed sensor [y1]
+    1 0 0 0 0 0;...     % backtrack from wheel speed sensor [y2]
+    0 0 1 0 0 0;...     % IMU for orientation [y3]
+    0 0 0 1 0 0;...     % Yaw rate sensor [y4]
+    0 0 0 0 1 0;...     % GPS X-pos [y5]
+    0 0 0 0 0 1;...     % GPS Y-pos [y6]
+    0 0 0 0 1 0;...     % Lidar X-pos [y7]
+    0 0 0 0 0 1] ;  % Lidar Y-pos [y8]
+           % Lidar orientation [y9] (9x6 matrix)
+
+% Check Observability for each observer
+
+ if rank(obsv(A,C1)) == 6
+     disp('Observable');
+ end
+ if rank(obsv(A,C2)) == 6
+    disp('Observable');
+ end
+ if rank(obsv(A,C3)) == 6
+       disp('Observable');
+ end
+
+ if rank(obsv(A,C4)) == 6
+       disp('Observable');
+ end
+ if rank(obsv(A,C5)) == 6
+       disp('Observable');
+ end
+
+ if rank(obsv(A,C6)) == 6
+       disp('Observable');
+ end
+ if rank(obsv(A,C7)) == 6
+       disp('Observable');
+ end
+ if rank(obsv(A,C8)) == 6
+       disp('Observable');
+ end
+ if rank(obsv(A,C9)) == 6
+       disp('Observable');
+ end
+
+%% PART 5: Residual generation and detection
+
+
+A = double(subs(Fk_j,[ux uy phi r X Y],x0'));
+
+B = [1/p.m 0;0 (2*p.Cf*p.lf*p.rst)/(p.Izz);0 0;0 (2*p.Cf*p.lf*p.rst)/(p.Izz);0 0;0 0]
+poles=[-40 -10 -25 -30 -10 -5]; % 10 times to the system poles
+load("A.mat");load("B.mat");load("y.mat");load('u_cl.mat');
+y=y(:,2:end)
+
+%A=[-0.0140 0 0 0 0 0;0 -8.2994 0 -13.8701 0 0;0 0.6458 0 -9.6197 0 0;0 0 0 1 0 0;1 -1 0 0 0 0;1 0 15 0 0 0];
+%D= zeros(9,2);
+
+y1 = y; y2=y; y3=y; y4=y; y5=y; y6=y; y7=y; y8=y; y9=y;
+
+% Decompose sensor measurements for designing each Observer.
+y1(1,:)=[];y2(2,:)=[];y3(3,:)=[];y4(4,:)=[];y5(5,:)=[];
+y6(6,:)=[];y7(7,:)=[];y8(8,:)=[];y9(9,:)=[];
+
+% Observer gain for each observer
+L1=place(A',C1',poles); 
+L1=L1';
+L2=place(A',C2',poles);
+L2=L2';
+L3=place(A',C3',poles);
+L3=L3';
+L4=place(A',C4',poles);
+L4=L4';
+L5=place(A',C5',poles);
+L5=L5';
+L6=place(A',C6',poles);
+L6=L6';
+L7=place(A',C7',poles);
+L7=L7';
+L8=place(A',C8',poles);
+L8=L8';
+L9=place(A',C9',poles);
+L9=L9';
+
+% Observer estimate initialization
+Xhat1=zeros(6,length(y(1,:))); Xhat1(:,1)=x0'
+Xhat2=zeros(6,length(y(2,:)));Xhat2(:,1)=x0'
+Xhat3=zeros(6,length(y(2,:)));Xhat3(:,1)=x0'
+Xhat4=zeros(6,length(y(2,:)));Xhat4(:,1)=x0'
+Xhat5=zeros(6,length(y(2,:)));Xhat5(:,1)=x0'
+Xhat6=zeros(6,length(y(2,:)));Xhat6(:,1)=x0'
+Xhat7=zeros(6,length(y(2,:)));Xhat7(:,1)=x0'
+Xhat8=zeros(6,length(y(2,:)));Xhat8(:,1)=x0'
+Xhat9=zeros(6,length(y(2,:)));Xhat9(:,1)=x0'
+
+% loop to estimate observer states for each observer
+for i = 1:45
+  
+   Xhat1(:,i+1) = dt*(A*Xhat1(:,i) + B*u_cl(:,i) + L1*((C1*Xhat1(:,i)) - y1(:,i))) + Xhat1(:,i);
+   Xhat2(:,i+1) = dt*(A*Xhat2(:,i) + B*u_cl(:,i) + L2*((C2*Xhat2(:,i)) - y2(:,i))) + Xhat2(:,i);
+   Xhat3(:,i+1) = dt*(A*Xhat3(:,i) + B*u_cl(:,i) + L3*((C3*Xhat2(:,i)) - y3(:,i))) + Xhat3(:,i);
+   Xhat4(:,i+1) = dt*(A*Xhat4(:,i) + B*u_cl(:,i) + L4*((C4*Xhat2(:,i)) - y4(:,i))) + Xhat4(:,i);
+   Xhat5(:,i+1) = dt*(A*Xhat5(:,i) + B*u_cl(:,i) + L5*((C5*Xhat2(:,i)) - y5(:,i))) + Xhat5(:,i);
+   Xhat6(:,i+1) = dt*(A*Xhat6(:,i) + B*u_cl(:,i) + L6*((C6*Xhat2(:,i)) - y6(:,i))) + Xhat6(:,i);
+   Xhat7(:,i+1) = dt*(A*Xhat7(:,i) + B*u_cl(:,i) + L7*((C7*Xhat2(:,i)) - y7(:,i))) + Xhat7(:,i);
+   Xhat8(:,i+1) = dt*(A*Xhat8(:,i) + B*u_cl(:,i) + L8*((C8*Xhat2(:,i)) - y8(:,i))) + Xhat8(:,i);
+   Xhat9(:,i+1) = dt*(A*Xhat9(:,i) + B*u_cl(:,i) + L9*((C9*Xhat1(:,i)) - y9(:,i))) + Xhat9(:,i);
+end
+
+Yhat1 = C1*Xhat1; 
+Yhat2 = C2*Xhat2;
+Yhat3 = C3*Xhat3;
+Yhat4 = C4*Xhat4;
+Yhat5 = C5*Xhat5;
+Yhat6 = C6*Xhat6;
+Yhat7 = C7*Xhat7;
+Yhat8 = C8*Xhat8;
+Yhat9 = C9*Xhat9;
+
+%% observer estimate plots
+
+
+f3 = figure(3);
+
+plot(xx(6,:), xx(5,:),'b-','LineWidth',1.5);    % True state
+grid on; box on; hold on;
+
+plot(Xhat1(6,:),Xhat1(5,:),'LineWidth',1.5)% Estimated states
+
+hold on
+
+plot(y(6,:),y(5,:),'g--','LineWidth',1.5) % sensor measurement
+ylabel('X [m]'); xlabel('Y [m]');
+xlim([-40 40]); ylim([-20 140]);
+
+legend('True state','GOS estimated state','Sensor Measurements')
+%% PART 6: Show GPS malfunction detection by plotting the residuals
+
+%Defining primary residuals.
+rhat1= y1-Yhat1;
+rhat2= y2-Yhat2;
+rhat3= y3-Yhat3;
+rhat4= y4-Yhat4;
+rhat5= y5-Yhat5;
+rhat6= y6-Yhat6;
+rhat7= y7-Yhat7;
+rhat8= y8-Yhat8;
+rhat9= y9-Yhat9;
+
+% plotting the residuals
+
+figure(4)
+plot(t(1:35),rhat6(:,1:35),'linewidth',2)
+
+figure(5)
+plot(t(1:35),rhat1(:,1:35),'linewidth',2)
+
+
+
+
+
+
